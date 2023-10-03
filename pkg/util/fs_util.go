@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,6 +42,9 @@ import (
 	otiai10Cpy "github.com/otiai10/copy"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+
+	"github.com/agnivade/frodo"
+	"github.com/bep/debounce"
 )
 
 const (
@@ -86,11 +90,13 @@ type FileContext struct {
 	ExcludedFiles []string
 }
 
-type ExtractFunction func(string, *tar.Header, string, io.Reader) error
+type ExtractFunction func(string, *tar.Header, string, io.Reader, *sync.WaitGroup, func(f func())) error
 
 type FSConfig struct {
 	includeWhiteout bool
 	extractFunc     ExtractFunction
+	wg              *sync.WaitGroup
+	debounced       func(f func())
 }
 
 type FSOpt func(*FSConfig)
@@ -121,6 +127,8 @@ func IncludeWhiteout() FSOpt {
 
 func ExtractFunc(extractFunc ExtractFunction) FSOpt {
 	return func(opts *FSConfig) {
+		opts.wg = &sync.WaitGroup{}
+		opts.debounced = debounce.New(100 * time.Millisecond)
 		opts.extractFunc = extractFunc
 	}
 }
@@ -212,12 +220,13 @@ func GetFSFromLayers(root string, layers []v1.Layer, opts ...FSOpt) ([]string, e
 
 			}
 
-			if err := cfg.extractFunc(root, hdr, cleanedName, tr); err != nil {
+			if err := cfg.extractFunc(root, hdr, cleanedName, tr, cfg.wg, cfg.debounced); err != nil {
 				return nil, err
 			}
 
 			extractedFiles = append(extractedFiles, filepath.Join(root, cleanedName))
 		}
+		cfg.wg.Wait()
 	}
 	return extractedFiles, nil
 }
@@ -273,6 +282,8 @@ func childDirInIgnoreList(path string) bool {
 
 // UnTar returns a list of files that have been extracted from the tar archive at r to the path at dest
 func UnTar(r io.Reader, dest string) ([]string, error) {
+	debounced := debounce.New(0 * time.Millisecond)
+	var wg sync.WaitGroup
 	var extractedFiles []string
 	tr := tar.NewReader(r)
 	for {
@@ -284,15 +295,16 @@ func UnTar(r io.Reader, dest string) ([]string, error) {
 			return nil, err
 		}
 		cleanedName := filepath.Clean(hdr.Name)
-		if err := ExtractFile(dest, hdr, cleanedName, tr); err != nil {
+		if err := ExtractFile(dest, hdr, cleanedName, tr, &wg, debounced); err != nil {
 			return nil, err
 		}
 		extractedFiles = append(extractedFiles, filepath.Join(dest, cleanedName))
 	}
+	wg.Wait()
 	return extractedFiles, nil
 }
 
-func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader) error {
+func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader, wg *sync.WaitGroup, debounced func(f func())) error {
 	path := filepath.Join(dest, cleanedName)
 	base := filepath.Base(path)
 	dir := filepath.Dir(path)
@@ -311,7 +323,7 @@ func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader)
 	}
 	switch hdr.Typeflag {
 	case tar.TypeReg:
-		logrus.Tracef("Creating file %s", path)
+		logrus.Debugf("Creating file %s", path)
 
 		// It's possible a file is in the tar before its directory,
 		// or a file was copied over a directory prior to now
@@ -332,28 +344,47 @@ func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader)
 			}
 		}
 
-		currFile, err := os.Create(path)
-		if err != nil {
-			return err
-		}
+		//contents, err := io.ReadAll(tr)
+		//if err != nil {
+		//	return err
+		//}
+		buf := &bytes.Buffer{}
+		io.Copy(buf, tr)
+		wg.Add(1)
+		go func() {
+			err := frodo.WriteFile(path, buf.Bytes(), mode, func(_ int) {
+				logrus.Debugf("done with file %s", path)
+				defer wg.Done()
+			})
+			if err != nil {
+				wg.Done() // needed?  or does the callback run on err too?
+				fmt.Println(err)
+			}
+			debounced(func() {
+				logrus.Debugf("Run poll")
+				frodo.Poll()
+				logrus.Debugf("done with poll")
+			})
+		}()
+		//currFile, err := os.Create(path)
 
-		if _, err = io.Copy(currFile, tr); err != nil {
-			return err
-		}
+		//if _, err = io.Copy(currFile, tr); err != nil {
+		//	return err
+		//}
 
-		if err = setFilePermissions(path, mode, uid, gid); err != nil {
-			return err
-		}
+	//	if err = setFilePermissions(path, mode, uid, gid); err != nil {
+	//		return err
+	//	}
 
-		if err = writeSecurityXattrToTarFile(path, hdr); err != nil {
-			return err
-		}
+	//	if err = writeSecurityXattrToTarFile(path, hdr); err != nil {
+	//		return err
+	//	}
 
-		if err = setFileTimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
-			return err
-		}
+	//	if err = setFileTimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
+	//		return err
+	//	}
 
-		currFile.Close()
+	// currFile.Close()
 	case tar.TypeDir:
 		logrus.Tracef("Creating dir %s", path)
 		if err := MkdirAllWithPermissions(path, mode, int64(uid), int64(gid)); err != nil {
@@ -361,30 +392,30 @@ func ExtractFile(dest string, hdr *tar.Header, cleanedName string, tr io.Reader)
 		}
 
 	case tar.TypeLink:
-		logrus.Tracef("Link from %s to %s", hdr.Linkname, path)
-		abs, err := filepath.Abs(hdr.Linkname)
-		if err != nil {
-			return err
-		}
-		if CheckCleanedPathAgainstIgnoreList(abs) {
-			logrus.Tracef("Skipping link from %s to %s because %s is ignored", hdr.Linkname, path, hdr.Linkname)
-			return nil
-		}
-		// The base directory for a link may not exist before it is created.
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
-		// Check if something already exists at path
-		// If so, delete it
-		if FilepathExists(path) {
-			if err := os.RemoveAll(path); err != nil {
-				return errors.Wrapf(err, "error removing %s to make way for new link", hdr.Name)
-			}
-		}
-		link := filepath.Clean(filepath.Join(dest, hdr.Linkname))
-		if err := os.Link(link, path); err != nil {
-			return err
-		}
+		logrus.Debugf("Link from %s to %s", hdr.Linkname, path)
+		//abs, err := filepath.Abs(hdr.Linkname)
+		//if err != nil {
+		//	return err
+		//}
+		//if CheckCleanedPathAgainstIgnoreList(abs) {
+		//	logrus.Tracef("Skipping link from %s to %s because %s is ignored", hdr.Linkname, path, hdr.Linkname)
+		//	return nil
+		//}
+		//// The base directory for a link may not exist before it is created.
+		//if err := os.MkdirAll(dir, 0755); err != nil {
+		//	return err
+		//}
+		//// Check if something already exists at path
+		//// If so, delete it
+		//if FilepathExists(path) {
+		//	if err := os.RemoveAll(path); err != nil {
+		//		return errors.Wrapf(err, "error removing %s to make way for new link", hdr.Name)
+		//	}
+		//}
+		//link := filepath.Clean(filepath.Join(dest, hdr.Linkname))
+		//if err := os.Link(link, path); err != nil {
+		//	return err
+		//}
 
 	case tar.TypeSymlink:
 		logrus.Tracef("Symlink from %s to %s", hdr.Linkname, path)

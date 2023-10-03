@@ -20,7 +20,7 @@ VERSION_BUILD ?= 0
 VERSION ?= v$(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_BUILD)
 VERSION_PACKAGE = $(REPOPATH/pkg/version)
 
-SHELL := /bin/bash
+SHELL := /usr/bin/env bash
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 ORG := github.com/GoogleContainerTools
@@ -46,12 +46,11 @@ BUILD_ARG ?=
 export GO111MODULE = on
 export GOFLAGS = -mod=vendor
 
-
 out/executor: $(GO_FILES)
-	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -ldflags $(GO_LDFLAGS) -o $@ $(EXECUTOR_PACKAGE)
+	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=1 CGO_CFLAGS=-I/src/liburing/src/include CGO_LDFLAGS='-L/src/liburing/src -L/src/liburing/src/liburing.a' go build -ldflags $(GO_LDFLAGS) -o $@ $(EXECUTOR_PACKAGE)
 
 out/warmer: $(GO_FILES)
-	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=0 go build -ldflags $(GO_LDFLAGS) -o $@ $(WARMER_PACKAGE)
+	GOARCH=$(GOARCH) GOOS=$(GOOS) CGO_ENABLED=1 CGO_CFLAGS=-I/src/liburing/src/include CGO_LDFLAGS='-L/src/liburing/src -L/src/liburing/src/liburing.a' go build -ldflags $(GO_LDFLAGS) -o $@ $(WARMER_PACKAGE)
 
 .PHONY: install-container-diff
 install-container-diff:

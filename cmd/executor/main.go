@@ -17,16 +17,31 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/GoogleContainerTools/kaniko/cmd/executor/cmd"
 
 	"github.com/google/slowjam/pkg/stacklog"
+
+	"github.com/agnivade/frodo"
 )
 
 func main() {
 	s := stacklog.MustStartFromEnv("STACKLOG_PATH")
 	defer s.Stop()
+
+	err := frodo.Init()
+	if err != nil {
+		fmt.Println("init", err)
+		os.Exit(1)
+	}
+	defer frodo.Cleanup()
+	go func() {
+		for err := range frodo.Err() {
+			fmt.Println(err)
+		}
+	}()
 
 	if err := cmd.RootCmd.Execute(); err != nil {
 		os.Exit(1)

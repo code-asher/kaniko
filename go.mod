@@ -39,7 +39,11 @@ require (
 	golang.org/x/sync v0.3.0
 )
 
-require github.com/containerd/containerd v1.7.6
+require (
+	github.com/agnivade/frodo v0.0.0-20200629043348-55a39bb84f2e
+	github.com/bep/debounce v1.2.1
+	github.com/containerd/containerd v1.7.6
+)
 
 require (
 	github.com/googleapis/enterprise-certificate-proxy v0.3.1 // indirect
